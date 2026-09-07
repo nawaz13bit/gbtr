@@ -1,0 +1,13 @@
+[package]
+name = "gbtr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["blocking"] }
+scraper = "0.20"
+url = "2"
+ego-tree = "0.6"
+ratatui = "0.29"
+crossterm = "0.28"
+encoding_rs = "0.8"
