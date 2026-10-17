@@ -181,6 +181,22 @@ fn is_skipped(tag: &str) -> bool {
     matches!(tag, "script" | "style" | "head" | "noscript" | "svg")
 }
 
+/// Content the author hides from everyone (`hidden`, `aria-hidden`, inline
+/// `display:none`). Form controls are kept: `type=hidden` inputs carry values
+/// that must still be submitted.
+fn is_hidden(el: &Element) -> bool {
+    if matches!(el.name(), "input" | "form" | "html" | "body" | "main" | "article") {
+        return false;
+    }
+    if el.attr("hidden").is_some() || el.attr("aria-hidden") == Some("true") {
+        return true;
+    }
+    el.attr("style").is_some_and(|s| {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+        s.contains("display:none") || s.contains("visibility:hidden")
+    })
+}
+
 fn heading_level(tag: &str) -> Option<u8> {
     match tag {
         "h1" => Some(1),
@@ -399,6 +415,68 @@ struct Builder<'a> {
     form: Option<usize>,
 }
 
+/// Fewest consecutive headline paragraphs that count as a list.
+const MIN_CARDS: usize = 5;
+/// Longest headline-plus-blurb, in words, that still reads as a list entry.
+const MAX_CARD_WORDS: usize = 30;
+
+/// A short paragraph led by a link, where the link is most of the text:
+/// a headline card, whatever markup the site wrapped it in.
+fn is_card(block: &Block) -> bool {
+    let Block::Paragraph(inlines) = block else { return false };
+    let mut first = true;
+    let (mut words, mut link_words) = (0, 0);
+    for inline in inlines {
+        match inline {
+            Inline::Link { children, .. } => {
+                let mut text = String::new();
+                plain_text(children, &mut text);
+                let n = text.split_whitespace().count();
+                if n == 0 {
+                    continue;
+                }
+                words += n;
+                link_words += n;
+                first = false;
+            }
+            Inline::Text { text, .. } => {
+                let n = text.split_whitespace().count();
+                if n > 0 && first {
+                    return false;
+                }
+                words += n;
+            }
+            _ => {}
+        }
+    }
+    words > 0 && words <= MAX_CARD_WORDS && link_words * 2 >= words
+}
+
+/// Turns runs of headline cards (front pages, search results) into bullet
+/// lists so list-aware views can lay them out.
+fn group_cards(blocks: Vec<Block>) -> Vec<Block> {
+    let mut out = Vec::with_capacity(blocks.len());
+    let mut run: Vec<Block> = Vec::new();
+    fn flush(run: &mut Vec<Block>, out: &mut Vec<Block>) {
+        if run.len() >= MIN_CARDS {
+            let items = run.drain(..).map(|b| vec![b]).collect();
+            out.push(Block::List { ordered: false, start: 1, items });
+        } else {
+            out.append(run);
+        }
+    }
+    for block in blocks {
+        if is_card(&block) {
+            run.push(block);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(block);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 pub fn build(root: NodeRef<Node>, base: &Url) -> Doc {
     let mut builder = Builder {
         base,
@@ -414,7 +492,7 @@ pub fn build(root: NodeRef<Node>, base: &Url) -> Doc {
     let mut col = Collector::new(false);
     builder.walk(root, &mut col);
     Doc {
-        blocks: col.finish(),
+        blocks: group_cards(col.finish()),
         links: builder.links,
         headings: builder.headings,
         forms: builder.forms,
@@ -449,7 +527,7 @@ impl Builder<'_> {
 
     fn element(&mut self, node: NodeRef<Node>, el: &Element, col: &mut Collector) {
         let tag = el.name();
-        if is_skipped(tag) {
+        if is_skipped(tag) || is_hidden(el) {
             return;
         }
         if !col.inline_only

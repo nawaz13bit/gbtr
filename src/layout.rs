@@ -85,6 +85,7 @@ struct Emitter {
     tight: usize,
     depth: usize,
     hide_chrome: bool,
+    /// Show lists of short linked items as a table (number | title | details).
     /// Display text of each `Doc::fields` entry, parallel to it.
     fields: Vec<String>,
 }

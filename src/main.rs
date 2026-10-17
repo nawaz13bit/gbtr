@@ -15,8 +15,11 @@ mod cookies;
 mod doc;
 mod feed;
 mod layout;
+mod trail;
+mod view;
 
 use doc::FieldKind;
+use trail::TrailNode;
 use layout::Target;
 
 struct Page {
@@ -191,6 +194,15 @@ fn text_style(t: doc::TextStyle) -> ratatui::style::Style {
     style
 }
 
+/// Widest the page text gets before it's centered instead of stretched.
+const MAX_TEXT_COLS: u16 = 96;
+/// Terminal width from which the outline panel appears beside the page.
+const OUTLINE_MIN_TOTAL: u16 = 140;
+const OUTLINE_W: u16 = 36;
+/// Terminal width from which the left panel (trail or site nav) appears.
+const SIDE_MIN_TOTAL: u16 = 176;
+const SIDE_W: u16 = 36;
+
 enum Mode {
     Normal,
     UrlEntry,
@@ -200,6 +212,8 @@ enum Mode {
     Pane,
     /// Typing into the form field `App::field_edit`.
     Field,
+    /// Keyboard focus is on the left panel (trail or site nav).
+    Side,
 }
 
 /// All state specific to one browsing tab -- its own history, current page,
@@ -229,6 +243,31 @@ struct Tab {
     /// Expanded nodes of the links overlay: `(region, "")` for a region,
     /// `(region, name)` for a section within it.
     pane_expanded: std::collections::HashSet<(doc::Region, String)>,
+    /// View picked with `v` for the site shown in this tab; it applies only
+    /// while the tab stays on that host.
+    view_pick: Option<(String, Option<view::View>)>,
+    /// Pages visited in all tabs as one tree (kept on disk between runs),
+    /// and the node this tab shows.
+    trail: SharedTrail,
+    trail_at: usize,
+    /// Selection within `side_rows()` while the left panel has focus.
+    side_cursor: usize,
+}
+
+/// The trail every tab adds to.
+type SharedTrail = std::rc::Rc<std::cell::RefCell<Vec<TrailNode>>>;
+
+/// What the left panel shows; `s` cycles through these.
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    /// The pages you've visited, as a tree.
+    Trail,
+    Off,
+}
+
+enum SideRow {
+    /// Trail node index and depth.
+    Trail(usize, usize),
 }
 
 struct PaneGroup {
@@ -248,10 +287,23 @@ enum PaneRow {
 }
 
 impl Tab {
-    fn new(client: &reqwest::blocking::Client, url: Url) -> Result<Tab, String> {
+    fn new(client: &reqwest::blocking::Client, url: Url, trail: SharedTrail) -> Result<Tab, String> {
         let url = rewrite_url(&url);
         let page = fetch(client, &url).map_err(|e| e.to_string())?;
-        Ok(Tab {
+        Ok(Tab::with_page(url, page, trail))
+    }
+
+    /// A tab showing `page`, which starts a new root in the shared trail.
+    fn with_page(url: Url, page: Page, trail: SharedTrail) -> Tab {
+        let trail_at = {
+            let mut nodes = trail.borrow_mut();
+            nodes.push(TrailNode { url: url.clone(), title: page.title.clone(), parent: None });
+            nodes.len() - 1
+        };
+        let mut tab = Tab {
+            trail,
+            trail_at,
+            side_cursor: 0,
             history: vec![url],
             hist_pos: 0,
             page,
@@ -267,7 +319,94 @@ impl Tab {
             laid_hid_chrome: false,
             pane_cursor: 0,
             pane_expanded: Default::default(),
-        })
+            view_pick: None,
+        };
+        tab.save_trail();
+        tab
+    }
+
+    /// The visited pages as a tree, in the order shown by the trail panel:
+    /// `(node index, depth)`, children after their parent.
+    fn trail_rows(&self) -> Vec<(usize, usize)> {
+        let trail = self.trail.borrow();
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); trail.len()];
+        let mut roots = Vec::new();
+        for (i, n) in trail.iter().enumerate() {
+            match n.parent {
+                Some(p) => children[p].push(i),
+                None => roots.push(i),
+            }
+        }
+        let mut rows = Vec::new();
+        let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|i| (i, 0)).collect();
+        while let Some((i, depth)) = stack.pop() {
+            rows.push((i, depth));
+            stack.extend(children[i].iter().rev().map(|&c| (c, depth + 1)));
+        }
+        rows
+    }
+
+    /// What the left panel lists in `side` mode.
+    fn side_rows(&self, side: Side) -> Vec<SideRow> {
+        match side {
+            Side::Trail => self.trail_rows().into_iter().map(|(idx, depth)| SideRow::Trail(idx, depth)).collect(),
+            Side::Off => Vec::new(),
+        }
+    }
+
+    fn save_trail(&mut self) {
+        if let Err(e) = trail::save(&self.trail.borrow()) {
+            self.status = format!("could not save trail: {e}");
+        }
+    }
+
+    /// After back/forward, points the trail at the node for the current URL.
+    fn sync_trail(&mut self) {
+        let url = &self.history[self.hist_pos];
+        let found = self.trail.borrow().iter().rposition(|n| &n.url == url);
+        if let Some(i) = found {
+            self.trail_at = i;
+        }
+    }
+
+    /// Opens a node of the trail without growing the tree.
+    fn jump_trail(&mut self, client: &reqwest::blocking::Client, idx: usize) {
+        let Some(url) = self.trail.borrow().get(idx).map(|n| n.url.clone()) else { return };
+        match fetch(client, &url) {
+            Ok(page) => {
+                self.history.truncate(self.hist_pos + 1);
+                self.history.push(url);
+                self.hist_pos = self.history.len() - 1;
+                self.page = page;
+                self.laid.lines.clear();
+                self.page_index = 0;
+                self.link_cursor = 0;
+                self.pending.clear();
+                self.status.clear();
+                self.trail_at = idx;
+            }
+            Err(e) => self.status = format!("error: {e}"),
+        }
+    }
+
+    /// The view this tab shows: a pick made with `v` on this host, else the
+    /// site's saved view, else compact. The bool says whether it was chosen
+    /// (true) or is the default (false).
+    fn effective_view(&self, saved: &view::SiteViews) -> (view::View, bool) {
+        let host = view::SiteViews::host_of(&self.history[self.hist_pos]);
+        if let Some((h, v)) = &self.view_pick
+            && Some(h) == host.as_ref()
+        {
+            // `None` is an explicit "default", which also overrides a saved view.
+            return match v {
+                Some(v) => (*v, true),
+                None => (view::View::Compact, false),
+            };
+        }
+        if let Some(v) = host.as_deref().and_then(|h| saved.get(h)) {
+            return (v, true);
+        }
+        (view::View::Compact, false)
     }
 
     fn navigate(&mut self, client: &reqwest::blocking::Client, url: Url) {
@@ -283,12 +422,22 @@ impl Tab {
                 self.history.truncate(self.hist_pos + 1);
                 self.history.push(url);
                 self.hist_pos = self.history.len() - 1;
+                self.trail_at = {
+                    let mut nodes = self.trail.borrow_mut();
+                    nodes.push(TrailNode {
+                        url: self.history[self.hist_pos].clone(),
+                        title: page.title.clone(),
+                        parent: Some(self.trail_at),
+                    });
+                    nodes.len() - 1
+                };
                 self.page = page;
                 self.laid.lines.clear();
                 self.page_index = 0;
                 self.link_cursor = 0;
                 self.pending.clear();
                 self.status.clear();
+                self.save_trail();
             }
             Err(e) => self.status = format!("error: {e}"),
         }
@@ -302,6 +451,7 @@ impl Tab {
         let url = self.history[self.hist_pos].clone();
         match fetch(client, &url) {
             Ok(page) => {
+                self.sync_trail();
                 self.page = page;
                 self.laid.lines.clear();
                 self.page_index = 0;
@@ -324,6 +474,7 @@ impl Tab {
         let url = self.history[self.hist_pos].clone();
         match fetch(client, &url) {
             Ok(page) => {
+                self.sync_trail();
                 self.page = page;
                 self.laid.lines.clear();
                 self.page_index = 0;
@@ -650,6 +801,10 @@ struct App {
     /// Set by `c` (new tab) so the next `Mode::UrlEntry` submission opens a
     /// fresh tab instead of navigating the active one.
     new_tab_pending: bool,
+    site_views: view::SiteViews,
+    /// What the left panel shows, and whether the last frame had room for it.
+    side: Side,
+    side_visible: bool,
 }
 
 impl App {
@@ -694,9 +849,25 @@ impl App {
         self.active_tab_mut().jump_to_line(line);
     }
 
+    /// Forgets every trail node except the page each tab is showing.
+    fn clear_trail(&mut self) {
+        let shared = self.active_tab().trail.clone();
+        let kept: Vec<TrailNode> = {
+            let nodes = shared.borrow();
+            self.tabs.iter().map(|t| TrailNode { parent: None, ..nodes[t.trail_at].clone() }).collect()
+        };
+        *shared.borrow_mut() = kept;
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            t.trail_at = i;
+            t.side_cursor = 0;
+        }
+        self.active_tab_mut().save_trail();
+    }
+
     /// Opens `url` in a brand-new tab and switches focus to it.
     fn open_tab(&mut self, url: Url) {
-        match Tab::new(&self.client, url) {
+        let trail = self.active_tab().trail.clone();
+        match Tab::new(&self.client, url, trail) {
             Ok(tab) => {
                 self.tabs.push(tab);
                 self.active = self.tabs.len() - 1;
@@ -743,12 +914,37 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Menus, sidebars and footers never take page space; their links live in
     // the overlay pane on demand (`l`).
-    let content_area = rows[0];
+    let (page_view, _) = app.active_tab().effective_view(&app.site_views);
+    // On wide terminals the page's headings fill the right margin as an
+    // outline, so the space beside the reading column isn't wasted.
+    let outline_on = rows[0].width >= OUTLINE_MIN_TOTAL && app.active_tab().page.doc.headings.len() >= 2;
+    let side_on = app.side != Side::Off && rows[0].width >= SIDE_MIN_TOTAL;
+    app.side_visible = side_on;
+    let mut constraints = Vec::new();
+    if side_on {
+        constraints.push(Constraint::Length(SIDE_W));
+    }
+    constraints.push(Constraint::Min(0));
+    if outline_on {
+        constraints.push(Constraint::Length(OUTLINE_W));
+    }
+    let mut split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(rows[0])
+        .to_vec()
+        .into_iter();
+    let side_area = if side_on { split.next() } else { None };
+    let content_area = split.next().unwrap_or(rows[0]);
+    let outline_area = if outline_on { split.next() } else { None };
 
     let inner_width = content_area.width.saturating_sub(2);
     let inner_height = content_area.height.saturating_sub(2);
+    // Long lines are hard to read, so text is capped to a column and centered.
+    let text_width = if page_view == view::View::Plain { inner_width } else { inner_width.min(MAX_TEXT_COLS) };
+    let left_pad = ((inner_width - text_width) / 2) as usize;
     let total_pages = {
-        app.active_tab_mut().ensure_layout(inner_width, inner_height, true);
+        app.active_tab_mut().ensure_layout(text_width, inner_height, true);
         app.active_tab().page_count()
     };
 
@@ -781,6 +977,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         .iter()
         .map(|laid_line| {
             let mut spans = Vec::new();
+            if left_pad > 0 {
+                spans.push(Span::raw(" ".repeat(left_pad)));
+            }
             for (i, s) in laid_line.segs.iter().enumerate() {
                 let mut style = text_style(s.style);
                 if let Some(t) = s.target {
@@ -807,24 +1006,119 @@ fn ui(f: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let title_text = if app.active_tab().page.title.is_empty() {
-        "(untitled)".to_string()
-    } else {
-        app.active_tab().page.title.clone()
+    let site = {
+        let tab = app.active_tab();
+        match tab.history[tab.hist_pos].host_str() {
+            Some(host) => host.to_string(),
+            None if tab.page.title.is_empty() => "(untitled)".to_string(),
+            None => tab.page.title.clone(),
+        }
     };
     let block_title = format!(
-        " {} — {}  [page {}/{}]  [tab {}/{}] ",
-        title_text,
-        app.active_tab().history[app.active_tab().hist_pos],
+        " tab {}/{}  page {}/{}  {} ",
+        app.active + 1,
+        app.tabs.len(),
         app.active_tab().page_index + 1,
         total_pages,
-        app.active + 1,
-        app.tabs.len()
+        page_view.label(),
     );
-    let block = Block::default().borders(Borders::ALL).title(block_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(block_title))
+        .title(Line::from(format!(" {site} ")).right_aligned());
 
     let paragraph = Paragraph::new(Text::from(content_lines)).block(block);
     f.render_widget(paragraph, content_area);
+
+    if let Some(area) = side_area {
+        let tab = app.active_tab();
+        let rows = tab.side_rows(app.side);
+        let focused = matches!(app.mode, Mode::Side);
+        let cursor = tab.side_cursor.min(rows.len().saturating_sub(1));
+        let room = area.width.saturating_sub(2) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        let mut focus_row = 0;
+        for (n, row) in rows.iter().enumerate() {
+            let (text, current) = match row {
+                SideRow::Trail(idx, depth) => {
+                    let nodes = tab.trail.borrow();
+                    let node = &nodes[*idx];
+                    let name = if node.title.trim().is_empty() {
+                        format!("{}{}", node.url.host_str().unwrap_or(""), node.url.path())
+                    } else {
+                        node.title.trim().to_string()
+                    };
+                    // Tabs (1-based) currently showing this node.
+                    let shown: Vec<String> = app
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| t.trail_at == *idx)
+                        .map(|(i, _)| (i + 1).to_string())
+                        .collect();
+                    let current = *idx == tab.trail_at;
+                    let mark = if current { "● " } else if shown.is_empty() { "• " } else { "○ " };
+                    let tabs = if shown.is_empty() { String::new() } else { format!(" [{}]", shown.join(",")) };
+                    (format!("{}{mark}{name}{tabs}", "  ".repeat((*depth).min(6))), current)
+                }
+            };
+            let style = if focused && n == cursor {
+                selected_link_style
+            } else if current {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if (focused && n == cursor) || (!focused && current) {
+                focus_row = n;
+            }
+            lines.push(Line::from(Span::styled(text.chars().take(room).collect::<String>(), style)));
+        }
+        let title = " trail ";
+        let border = if focused { Style::default().fg(Color::Cyan) } else { Style::default() };
+        let visible = area.height.saturating_sub(2) as usize;
+        let scroll = focus_row.saturating_sub(visible.saturating_sub(1) / 2) as u16;
+        let panel = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).border_style(border).title(title))
+            .scroll((scroll, 0));
+        f.render_widget(panel, area);
+    }
+
+    if let Some(area) = outline_area {
+        let room = area.width.saturating_sub(2) as usize;
+        let tab = app.active_tab();
+        // The section being read: the last heading at or above the selected
+        // link, or above the top of the screen when nothing is selected.
+        let page_top = tab.page_index * tab.page_height();
+        let reading_line = selected_target
+            .and_then(|t| {
+                tab.current_lines().iter().position(|l| l.segs.iter().any(|s| s.target == Some(t)))
+            })
+            .map_or(page_top, |i| page_top + i);
+        let active = tab.laid.heading_lines.iter().rposition(|&l| l <= reading_line);
+        let lines: Vec<Line> = tab
+            .page
+            .doc
+            .headings
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let text = format!("{}{}", "  ".repeat((h.level as usize).saturating_sub(1).min(3)), h.label);
+                let style = if Some(i) == active {
+                    selected_link_style
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                Line::from(Span::styled(text.chars().take(room).collect::<String>(), style))
+            })
+            .collect();
+        let visible = area.height.saturating_sub(2) as usize;
+        let scroll = active.map_or(0, |a| a.saturating_sub(visible.saturating_sub(1) / 2)) as u16;
+        let outline = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" outline "))
+            .scroll((scroll, 0));
+        f.render_widget(outline, area);
+    }
 
     let pane_focused = matches!(app.mode, Mode::Pane);
     let pane_target = if pane_focused {
@@ -937,8 +1231,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         Mode::Search => "type query  Enter: find  Esc: cancel".to_string(),
         Mode::Pane => "↑/↓ select  Enter: expand/collapse or follow  Esc: back to page".to_string(),
         Mode::Field => "type  Enter: submit  Tab: next  Esc: cancel".to_string(),
+        Mode::Side => "↑/↓ select  Enter: open  D: clear trail  s: hide  Tab/Esc: back to page".to_string(),
         Mode::Normal => {
-            "l: links  ←/→ page  g/G first/last  ↑/↓ select  <N> Enter: jump  Enter: follow  b/f: back/fwd  u: url  /: find  t: contents  c/x: new/close tab  [/]: switch tab  q: quit"
+            "Tab: trail panel  s: show/hide trail  v: view  l: links  ←/→ page  g/G first/last  ↑/↓ select  <N> Enter: jump  Enter: follow  b/f: back/fwd  u: url  /: find  t: contents  c/x: new/close tab  [/]: switch tab  q: quit"
                 .to_string()
         }
     };
@@ -962,6 +1257,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             match tab.pane_selected() {
                 Some(PaneRow::Link(id, _)) => tab.page.doc.links[id].href.clone(),
                 _ => String::new(),
+            }
+        }
+        Mode::Side => {
+            let tab = app.active_tab();
+            let rows = tab.side_rows(app.side);
+            match rows.get(tab.side_cursor.min(rows.len().saturating_sub(1))) {
+                Some(SideRow::Trail(idx, _)) => tab.trail.borrow()[*idx].url.to_string(),
+                None => String::new(),
             }
         }
         Mode::Normal => {
@@ -1118,6 +1421,32 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                         app.active_tab_mut().pane_cursor = 0;
                         app.mode = Mode::Pane;
                     }
+                    KeyCode::Char('s') => {
+                        app.side = match app.side {
+                            Side::Trail => Side::Off,
+                            Side::Off => Side::Trail,
+                        };
+                        app.active_tab_mut().status = match app.side {
+                            Side::Trail => "left panel: trail of visited pages",
+                            Side::Off => "left panel: off",
+                        }
+                        .to_string();
+                    }
+                    KeyCode::Tab => {
+                        if app.side_visible {
+                            let tab = app.active_tab();
+                            let at = tab
+                                .side_rows(app.side)
+                                .iter()
+                                .position(|r| matches!(r, SideRow::Trail(i, _) if *i == tab.trail_at))
+                                .unwrap_or(0);
+                            app.active_tab_mut().side_cursor = at;
+                            app.mode = Mode::Side;
+                        } else {
+                            app.active_tab_mut().status =
+                                format!("left panel needs a terminal at least {SIDE_MIN_TOTAL} columns wide (s turns it on)");
+                        }
+                    }
                     KeyCode::Char('t') => {
                         app.active_tab_mut().toc_cursor = 0;
                         app.mode = Mode::Toc;
@@ -1129,6 +1458,35 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     }
                     KeyCode::Char('x') => {
                         app.close_tab();
+                    }
+                    KeyCode::Char('v') => {
+                        let tab = app.active_tab_mut();
+                        if let Some(host) = view::SiteViews::host_of(&tab.history[tab.hist_pos]) {
+                            let current = tab.view_pick.as_ref().filter(|(h, _)| *h == host).and_then(|&(_, v)| v);
+                            let next = view::View::cycle(current);
+                            tab.view_pick = Some((host, next));
+                            tab.status = match next {
+                                Some(v) => format!("view: {} (V saves it for this site)", v.label()),
+                                None => "view: default (V forgets the saved view)".to_string(),
+                            };
+                        }
+                    }
+                    KeyCode::Char('V') => {
+                        // Saves what's on screen for this site; with an
+                        // automatic view it forgets the saved choice instead.
+                        let (shown, chosen) = app.active_tab().effective_view(&app.site_views);
+                        let tab = &app.tabs[app.active];
+                        if let Some(host) = view::SiteViews::host_of(&tab.history[tab.hist_pos]) {
+                            let pick = if chosen { Some(shown) } else { None };
+                            let msg = match app.site_views.set(&host, pick) {
+                                Ok(()) => match pick {
+                                    Some(v) => format!("{host} will always open as {}", v.label()),
+                                    None => format!("forgot the saved view for {host}"),
+                                },
+                                Err(e) => format!("could not save view: {e}"),
+                            };
+                            app.active_tab_mut().status = msg;
+                        }
                     }
                     KeyCode::Char(']') => {
                         app.next_tab();
@@ -1162,6 +1520,39 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                         None => app.mode = Mode::Normal,
                     },
                     KeyCode::Esc | KeyCode::Char('l') => app.mode = Mode::Normal,
+                    _ => {}
+                },
+                Mode::Side => match key.code {
+                    KeyCode::Up => {
+                        app.active_tab_mut().side_cursor = app.active_tab().side_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let len = app.active_tab().side_rows(app.side).len();
+                        if app.active_tab().side_cursor + 1 < len {
+                            app.active_tab_mut().side_cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let tab = app.active_tab();
+                        let rows = tab.side_rows(app.side);
+                        if let Some(SideRow::Trail(idx, _)) = rows.get(tab.side_cursor.min(rows.len().saturating_sub(1))) {
+                            let idx = *idx;
+                            app.mode = Mode::Normal;
+                            app.active_tab_mut().status = "loading ...".to_string();
+                            terminal.draw(|f| ui(f, app))?;
+                            let client = app.client.clone();
+                            app.active_tab_mut().jump_trail(&client, idx);
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        app.side = Side::Off;
+                        app.mode = Mode::Normal;
+                    }
+                    KeyCode::Char('D') => {
+                        app.clear_trail();
+                        app.active_tab_mut().status = "trail cleared".to_string();
+                    }
+                    KeyCode::Esc | KeyCode::Tab => app.mode = Mode::Normal,
                     _ => {}
                 },
                 Mode::Toc => match key.code {
@@ -1309,23 +1700,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let tab = Tab {
-        history: vec![start_url],
-        hist_pos: 0,
-        page,
-        laid: layout::Layout::default(),
-        page_index: 0,
-        layout_dims: (0, 0),
-        link_cursor: 0,
-        pending: String::new(),
-        status: String::new(),
-        toc_cursor: 0,
-        search_query: String::new(),
-        search_last_hit: None,
-        laid_hid_chrome: false,
-        pane_cursor: 0,
-        pane_expanded: Default::default(),
-    };
+    // Earlier runs' trail comes first; this run's start page is a new root.
+    let shared: SharedTrail = std::rc::Rc::new(std::cell::RefCell::new(trail::load()));
+    let tab = Tab::with_page(start_url, page, shared);
 
     let mut app = App {
         client,
@@ -1335,6 +1712,9 @@ fn main() -> ExitCode {
         input: String::new(),
         field_edit: 0,
         new_tab_pending: false,
+        site_views: view::SiteViews::load(),
+        side: Side::Trail,
+        side_visible: false,
     };
 
     if let Err(e) = enable_raw_mode() {
